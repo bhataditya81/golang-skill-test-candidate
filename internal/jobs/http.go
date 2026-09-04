@@ -24,10 +24,6 @@ func RegisterHandlers(mux *http.ServeMux, service *Service) {
 
 		job, err := service.Create(r.Context(), req.Payload)
 		if err != nil {
-			if strings.Contains(err.Error(), "queue is full") {
-				writeError(w, http.StatusServiceUnavailable, err.Error())
-				return
-			}
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}

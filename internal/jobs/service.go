@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,15 +31,28 @@ type Processor interface {
 	Process(ctx context.Context, payload string) error
 }
 
+var (
+	ErrQueueFull = errors.New("job queue is full")
+	ErrStopping  = errors.New("service is stopping")
+)
+
 type Service struct {
-	mu        sync.RWMutex
-	jobs      map[string]*Job
+	mu   sync.RWMutex
+	jobs map[string]*Job
+
+	// stopMu guards stopping and the close of queue, so Create's
+	// check-then-send can never race a concurrent Stop closing the channel.
+	stopMu   sync.RWMutex
+	stopping bool
+
 	queue     chan string
 	workers   int
 	processor Processor
-	stopping  atomic.Bool
 	wg        sync.WaitGroup
 	sequence  atomic.Uint64
+
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 func NewService(workers, queueCapacity int) *Service {
@@ -49,11 +63,14 @@ func NewService(workers, queueCapacity int) *Service {
 		queueCapacity = 1
 	}
 
+	shutdownCtx, cancel := context.WithCancel(context.Background())
 	s := &Service{
-		jobs:      make(map[string]*Job),
-		queue:     make(chan string, queueCapacity),
-		workers:   workers,
-		processor: ProcessorFunc(defaultProcessor),
+		jobs:           make(map[string]*Job),
+		queue:          make(chan string, queueCapacity),
+		workers:        workers,
+		processor:      ProcessorFunc(defaultProcessor),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: cancel,
 	}
 	s.wg.Add(workers)
 	for i := 0; i < workers; i++ {
@@ -77,27 +94,26 @@ func defaultProcessor(ctx context.Context, payload string) error {
 	if payload == "" {
 		return errors.New("empty payload")
 	}
-	if containsFail(payload) {
+	if strings.Contains(payload, "fail") {
 		return errors.New("simulated processing failure")
 	}
 	return nil
 }
 
-func containsFail(s string) bool {
-	for i := 0; i+4 <= len(s); i++ {
-		if s[i:i+4] == "fail" {
-			return true
-		}
-	}
-	return false
+func (s *Service) nextID() string {
+	return fmt.Sprintf("job-%d", s.sequence.Add(1))
 }
 
 func (s *Service) Create(ctx context.Context, payload string) (*Job, error) {
-	if s.stopping.Load() {
-		return nil, errors.New("service is stopping")
+	// Held for the whole check-then-send below so Stop cannot close the
+	// queue out from under us: close only happens under stopMu's write lock.
+	s.stopMu.RLock()
+	defer s.stopMu.RUnlock()
+	if s.stopping {
+		return nil, ErrStopping
 	}
 
-	id := fmt.Sprintf("job-%d", s.sequence.Add(1))
+	id := s.nextID()
 	job := &Job{
 		ID:        id,
 		Payload:   payload,
@@ -118,7 +134,10 @@ func (s *Service) Create(ctx context.Context, payload string) (*Job, error) {
 		s.mu.Unlock()
 		return nil, ctx.Err()
 	default:
-		return nil, errors.New("job queue is full")
+		s.mu.Lock()
+		delete(s.jobs, id)
+		s.mu.Unlock()
+		return nil, ErrQueueFull
 	}
 }
 
@@ -149,7 +168,7 @@ func (s *Service) process(id string) {
 	job.Status = StatusProcessing
 	s.mu.Unlock()
 
-	err := s.processor.Process(context.Background(), job.Payload)
+	err := s.processor.Process(s.shutdownCtx, job.Payload)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,10 +181,15 @@ func (s *Service) process(id string) {
 }
 
 func (s *Service) Stop() {
-	if s.stopping.Swap(true) {
+	s.stopMu.Lock()
+	if s.stopping {
+		s.stopMu.Unlock()
 		return
 	}
+	s.stopping = true
 	close(s.queue)
+	s.stopMu.Unlock()
+	s.shutdownCancel()
 	s.wg.Wait()
 }
 
