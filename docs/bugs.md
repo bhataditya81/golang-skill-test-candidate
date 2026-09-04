@@ -6,3 +6,4 @@
 - Cancellation is wired but dead: `defaultProcessor` checks `ctx.Done()`, but `process()` always calls it with `context.Background()`, so in-flight work can never be cancelled on shutdown.
 - `http.go`'s queue-full branch and its `else` do the same thing — dead conditional, and matching on `err.Error()` string content is fragile.
 - `containsFail` hand-rolls what `strings.Contains` already does — not a bug, just noise.
+- Data race in `Create`'s success path: `cloneJob(job)` was called after `s.queue <- id` but without holding `s.mu`, reading `job.Status`/`job.Error` while a worker could already be writing them from `process()`.

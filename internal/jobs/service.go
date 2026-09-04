@@ -123,11 +123,12 @@ func (s *Service) Create(ctx context.Context, payload string) (*Job, error) {
 
 	s.mu.Lock()
 	s.jobs[id] = job
+	snapshot := cloneJob(job)
 	s.mu.Unlock()
 
 	select {
 	case s.queue <- id:
-		return cloneJob(job), nil
+		return snapshot, nil
 	case <-ctx.Done():
 		s.mu.Lock()
 		delete(s.jobs, id)
